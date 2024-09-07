@@ -1,0 +1,1405 @@
+#!/usr/bin/env python3
+
+# Copyright (C) 2017-2022 Arnaud VALLETTE d'OSIA, aka Arnaudv6
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more detailsets.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# pylint: disable=too-many-lines
+
+import argparse
+import configparser
+import curses
+import itertools
+import locale
+import os
+import pickle
+import signal
+import subprocess
+import sys
+import termios
+import tty
+from operator import itemgetter
+from select import select
+from unicodedata import normalize, combining
+
+SCRIPT_REVISION = '20230518'
+
+
+class ReiceivedSignal(Exception):
+    """raised on receiving a signal
+    see https://docs.python.org/3/library/signal.html#handlers-and-exceptions"""
+
+
+def get_xdg_music_dir():
+    """return user music path based on XDG_USER_DIRS.
+    pyxdg module is no perfect match for the task anyway.
+    output must be sanitized with os.path.expanduser()"""
+    # todo fix: XDG_CONFIG_HOME might not be set. use SETTINGS['xdg_config_home']?
+    try:
+        with open(os.path.expanduser('~/.config/user-dirs.dirs')) as file:
+            for line in file:
+                if line.startswith('XDG_MUSIC_DIR'):
+                    return os.path.expandvars(line.partition('=')[2].strip(' "\t\n\r'))
+    except OSError:
+        pass  # Non-existent file or not readable...
+    return '~/Music/'
+
+
+def sanitize(dir_path):
+    """dir_path comes from user defined profiles or user-dirs.dirs"""
+
+    return os.path.join(os.path.normpath(os.path.expanduser(dir_path)), '')
+
+
+class Config:  # pylint: disable=too-few-public-methods
+    """Read settings from config file, fall back to default values"""
+
+    default_config = {
+        'backEndCommand': 'mpv --no-video --display-tags=""',
+        'userMusicsPath': get_xdg_music_dir(),
+        'printWaitDelay': 5,
+        'skipExtensions': 'jpg jpeg png txt nfo ini db srt',
+    }  # due to lizzy history, camelCase INI parameters are assigned to snake_case vars.
+
+    print_delay = 5
+
+    def __init__(self):
+        cfg = configparser.ConfigParser(defaults=Config.default_config)
+        try:
+            cfg.read(config_file('config.ini'))
+        except configparser.MissingSectionHeaderError:
+            print_error('File contains no section headers')
+            # search for print_error use...
+            # todo: mutualize an error message func that links to usage section of the site
+        if Config.profile not in cfg:  # No way to properly try and except that
+            cfg[Config.profile] = {}
+            print_error(f'error: "{Config.profile}" profile not found')
+            print_wait(f'consider editing "{config_file("config.ini")}"')
+            # No need to mention '--help': user was just there.
+
+        Config.mpv_command = cfg[Config.profile].get('backEndCommand').split()
+
+        try:
+            Config.print_delay = cfg[Config.profile].getint('printWaitDelay')
+        except ValueError:
+            print_error("printWaitDelay must be an int.")
+
+        Config.banned_exts = tuple(
+            (
+                f'.{ext.lower()}'
+                for ext in cfg[Config.profile].get('skipExtensions').split()
+            ),  # Without this coma, a single extension gets exploded to letters.
+        )
+
+        Config.user_musics_path = sanitize(cfg[Config.profile].get('userMusicsPath'))
+
+        # session_file is Used if no 'user_specified_playlist'
+        Config.session_file = config_file(f'{Config.profile}session.m3u')
+
+
+class Pane:
+    getitem = None
+    left_limit = 0
+    right_limit = 0
+
+    top_item = 0
+    selected = 0
+    items_len = 0
+
+    green = None
+    words = []
+
+    def __init__(self, getitem):
+        self.getitem = getitem
+
+    def update_items_len(self, value):
+        self.items_len = value
+        self.check_selection()
+
+    def move_selection(self, value):
+        self.selected = value
+        self.check_selection()
+
+    def move_selection_relative(self, value):
+        self.selected += value
+        self.check_selection()
+
+    def check_selection(self):
+        # min() and max() are slower than 'if' condition but OK
+        # https://stackoverflow.com/questions/33784519/
+        self.selected = min(self.selected, self.items_len - 1)
+        self.selected = max(self.selected, 0)
+        self.top_item = min(self.top_item, self.selected)
+        self.top_item = max(self.top_item, self.selected - settings['termH'] + 1)
+
+    def parse_left(self):
+        texts = itertools.islice(
+            settings['filtered_list'], self.top_item, self.top_item + settings['termH']
+        )
+        for uppercase, smallcase in texts:
+            yield uppercase[: self.right_limit], smallcase[: self.right_limit]
+
+    def parse_right(self):
+        texts = itertools.islice(
+            settings['playlist'], self.top_item, self.top_item + settings['termH']
+        )
+        for item in texts:
+            cased = os.path.basename(os.path.normpath(item))[: self.right_limit]
+            yield cased, convert_to_ascii_lower(cased)
+
+    def draw(self):
+        """print, then color the (fully printed) search_terms."""
+        item = self.getitem(self)
+        try:
+            for line in itertools.count(2):
+                cased, smallcased = next(item)
+
+                settings['stdscr'].addstr(line, self.left_limit, cased)
+                for word, length in Pane.words:
+                    for pos in get_substring_indexes(word, smallcased):
+                        settings['stdscr'].chgat(
+                            line, pos + self.left_limit, length, Pane.green
+                        )
+        except StopIteration:
+            pass
+
+        # then draw scrollbar, if relevant
+        page_height = max(self.items_len, self.top_item + settings['termH'])
+
+        # todo: use this inverted char as scrollbar, like micro does? |
+        if page_height > settings['termH']:
+            settings['stdscr'].vline(
+                int(settings['termH'] * (self.top_item / page_height) + 2),
+                self.left_limit + self.right_limit + 1,
+                curses.ACS_BOARD,
+                int(settings['termH'] * settings['termH'] / page_height) + 1,
+            )
+
+
+settings = {  # to keep track of globals. (no "static" vars in python)
+    'stdscr': None,
+    'shuffle_mode': False,
+    'play_all_mode': False,
+    'msg_and_action': (),
+    'music_db_list': [],  # list of tuples
+    'filtered_list': [],
+    'playlist': [],
+    'undo_playList': [],  # playlist change => settings['right'].update_items_len()
+    'selected_pane': 0,
+    'pane0_cursor': 0,
+    'left': Pane(Pane.parse_left),
+    'right': Pane(Pane.parse_right),
+    'search_terms': '',
+    'xdg_config_dir': os.path.join(
+        os.getenv('XDG_CONFIG_HOME', default=os.path.expanduser('~/.config')),
+        'lizzy',
+        '',
+    ),
+    'temp_dir': '/tmp/lizzy_player/',  # /tmp is posix
+    'unwrapped_action': None,
+}
+
+
+def config_file(filename):
+    os.makedirs(settings['xdg_config_dir'], exist_ok=True)  # it actually always exists.
+    return os.path.join(settings['xdg_config_dir'], filename)
+
+
+def music_db_file():
+    """Per-profile collection: for given user_musics_path, banned_exts may differ."""
+    return config_file(f'{Config.profile}collection.idx')
+
+
+def read_music_db_file():
+    """read the musics list from music_db_file to memory."""
+    try:
+        with open(music_db_file(), mode='rb') as file:
+            settings['music_db_list'] = pickle.load(file)
+            # Corrupted pickle files load just fine. Not checking any hash (yet).
+    except OSError:
+        print_error('Could not load music index file. Press ^u in lizzy to create one.')
+    make_unfiltered_short_list()  # run this even if no music_db_file
+
+
+def read_startup_playlist():
+    """load startup playlist (last session's playlist by default)."""
+    m3u_path = settings.get('user_specified_playlist', Config.session_file)
+    try:
+        with open(m3u_path) as m3u_file:
+            # is_url() function minds not the ending \n.
+            settings['playlist'] = [item.strip() for item in m3u_file if is_url(item)]
+    except (OSError, UnicodeDecodeError):
+        settings['msg_and_action'] = (f'Could not load playlist: {m3u_path}', None)
+    else:
+        settings['undo_playList'] = settings['playlist']  # Initialize '^Z'
+        length = len(settings["playlist"])
+        settings['msg_and_action'] = (f'{length} lines read from {m3u_path}', None)
+        settings['right'].update_items_len(length)
+
+
+def make_nice_dir_names_list():  # todo : make this a class
+    """make a comprehensive list of directories for browser mode.
+    This has good results against code-speed and readability."""
+
+    def nice_dir_name(dir_path):
+        """given a dir path, emphasize folder's depth and name."""
+        try:
+            position = dir_path.rindex('/', 0, -1)
+            return position * ' ' + dir_path[position:]
+            # Multiplicating (12x max) a single space is faster than slicing a string.
+            # or twice as fast as looking into an table of incrementing dash strings
+        except ValueError:  # rfind() would return -1, not 0
+            return dir_path
+
+    return (
+        (nice_dir_name(dir_path), '')
+        for dir_path, _ in settings['music_db_list']
+        if dir_path.endswith('/') and dir_path.rfind('/', 0, -1) < 10
+    )  # 10 is arbitrary. Not worth an algorithm for now I guess. But a config entry?
+
+
+def make_unfiltered_short_list():
+    def include_root_files(item_list):
+        return '/' not in item_list[0]
+
+    settings['short_list'] = [('/', '/')]
+    settings['short_list'].extend(make_nice_dir_names_list())
+    settings['short_list'].extend(filter(include_root_files, settings['music_db_list']))
+
+
+def convert_to_ascii_lower(string):
+    """translate given string to lowercase, basic ASCII (drop accents and all)"""
+    try:
+        string.encode('ASCII')  # encode() does not work in-place.
+        return string.lower()
+    except UnicodeEncodeError:
+        # Thanks MiniQuark on https://stackoverflow.com/questions/517923
+        nkfd_form = normalize('NFKD', string)
+        return ''.join([c for c in nkfd_form if not combining(c)]).lower()
+
+
+def walk_user_musics_path():
+    def drop_format_chars(partial_path):
+        if '\n' in partial_path or '\t' in partial_path:
+            # drop tricky chars for curses. any() is slower. No need for colored print()
+            print(f'ignored (illicit char in path): {repr(partial_path)}')
+            return False
+        return True
+
+    def drop_banned_exts(partial_path):
+        return not partial_path.lower().endswith(Config.banned_exts)
+
+    os.chdir(Config.user_musics_path)
+    # Setting curdir. Passing only one argument to os.path.relpath().
+    # This makes os.path.relpath() 10% slower, but improves readability
+
+    # Python 3.5+ bundles scandir.walk() its fast implementation, from pypi
+    for root, dirs, files in os.walk('.', followlinks=True):
+        for name in filter(drop_format_chars, dirs):
+            name = os.path.join(os.path.relpath(os.path.join(root, name)), '')
+            yield name, convert_to_ascii_lower(name)  # yielding a tuple
+        for name in filter(drop_banned_exts, filter(drop_format_chars, files)):
+            name = os.path.relpath(os.path.join(root, name))
+            yield name, convert_to_ascii_lower(name)  # yielding a tuple
+
+
+def update_music_db_file():
+    """on ^U, recursively list user_musics_path files into music_db_file.
+    Currently, empty folders are listed as well."""
+    print('\nUpdating database...')
+
+    try:
+        settings['music_db_list'] = list(walk_user_musics_path())
+    except OSError:
+        pass
+    else:
+        settings['music_db_list'].sort(key=itemgetter(1))
+
+    if settings['music_db_list']:  # List is indeed populated: save it to disk.
+        os.makedirs(settings['xdg_config_dir'], exist_ok=True)
+        with open(music_db_file(), mode='wb') as file:
+            pickle.dump(settings['music_db_list'], file)
+        make_unfiltered_short_list()
+        print_wait('Updated database.\n')  # In case we printed errors above.
+        make_filtered_list()
+    else:
+        print_error(f'No file to index in {Config.user_musics_path}\n')
+        print('Consider editing ~/.local/share/lizzy/config.ini as shown here:')
+        print_wait('https://gitlab.com/Arnaudv6/lizzy#usage')
+
+
+def ins_str_at_cur(key):
+    update_filter(before_cursor() + key + after_cursor())
+    settings['pane0_cursor'] += len(key)
+
+
+def update_filter(search_terms):
+    # If nothing but spaces, clear them. strip() does not work in place.
+    settings['search_terms'] = search_terms if search_terms.strip() else ''
+    settings['left'].move_selection(0)
+    make_filtered_list()
+
+
+def make_filtered_list():
+    """update settings['filtered_list'] matches against settings['search_terms']."""
+
+    # given 2 separate lists for UTF-8 and smalcaps-ascii itertools.compress()
+    # could do filtering... we could read curses buffer to color... but scrollbars?
+
+    # No need to strip() before split()
+    search_terms = convert_to_ascii_lower(settings['search_terms']).split()
+    search_terms.sort(key=len, reverse=True)  # Not making it a set for now.
+
+    if search_terms:
+
+        def search1(tup):
+            return search_terms[0] in tup[1]
+
+        def search2(tup):
+            return search_terms[0] in tup[1] and search_terms[1] in tup[1]
+
+        def search3(tup):
+            return (
+                search_terms[0] in tup[1]
+                and search_terms[1] in tup[1]
+                and search_terms[2] in tup[1]
+            )
+
+        def search4(tup):
+            return (
+                search_terms[0] in tup[1]
+                and search_terms[1] in tup[1]
+                and search_terms[2] in tup[1]
+                and search_terms[3] in tup[1]
+            )
+
+        def searchn(tup):
+            for word in search_terms:
+                if word not in tup[1]:
+                    return False
+            return True
+
+        # all() is much slower in this case. Even when using map() and lambda.
+        # 'in' is faster than regex on small strings, this flips with long strings.
+        # 'in' is 10x faster on strings than on bytes,
+        #   (and compiled re.search() is (a little) faster on strings also).
+        # filter + lambda is slower than list comprehension
+        # itemgetter(1)(tuple) is slower than accessing said index in search()
+        # I Assume unpack and repack would be slower.
+
+        try:
+            search = [search1, search2, search3, search4][len(search_terms) - 1]
+        except IndexError:
+            search = searchn
+
+        settings['filtered_list'] = list(filter(search, settings['music_db_list']))
+
+        if is_url(settings['search_terms']):  # Local files, internet radios...
+            settings['filtered_list'].append((settings['search_terms'], ''))
+        else:
+            settings['filtered_list'].append(SEARCH_YT)
+            # todo: this has nothing to do here: put it in ^B ?
+    else:
+        settings['filtered_list'] = settings['short_list']
+
+    settings['left'].update_items_len(len(settings['filtered_list']))
+
+
+def get_substring_indexes(substring, string):  # todo: put this in Panes class?
+    """return positions indices for each occurence of substring in
+    string. String and substring both are lowercase."""
+    position = -1
+    while True:
+        try:
+            position = string.index(substring, position + 1)
+            yield position
+        except ValueError:
+            break
+
+
+def reconstruct_path(troncated):
+    return os.path.join(Config.user_musics_path, troncated)
+
+
+def get_selected():
+    """return selected contents, recursively, drop folders"""
+    selected = settings['filtered_list'][settings['left'].selected][0]
+
+    if selected == SEARCH_YT[0]:
+        search = settings['search_terms'].replace('/', '+').replace(' ', '+')
+        # replace does not work in-place.
+        try:
+            subprocess.run(
+                ('xdg-open', f'https://www.youtube.com/results?search_query={search}'),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            settings['msg_and_action'] = (f'OK: {settings["search_terms"]}', None)
+        except (FileNotFoundError, OSError, ValueError, subprocess.SubprocessError):
+            settings['msg_and_action'] = (f'error: {settings["search_terms"]}', None)
+        return None
+    if is_url(selected):
+        return [selected]
+    if selected.endswith('/'):  # (but not an url, sic)
+        return (
+            reconstruct_path(item)
+            for item, _ in settings['music_db_list']
+            if item.startswith(selected) and not item.endswith('/')
+        )  # folder content for extend(). As a generator: so a singleton is no problem.
+    return [reconstruct_path(selected)]
+
+
+def get_all():
+    """on ^A, return all search results but folders."""
+    settings['msg_and_action'] = ('Added all to playlist', None)
+    return (
+        [settings['filtered_list'][0][0]]
+        if is_url(settings['filtered_list'][0][0])
+        else (
+            reconstruct_path(item)
+            for item, _ in settings['filtered_list'][:-1]  # [:-1] to dump SEARCH_YT
+            if not item.endswith('/')
+        )
+    )
+
+
+def append_to_playlist(append_intent_source=get_selected, play_if_successful=False):
+    if settings['filtered_list'][settings['left'].selected] == ('/', '/'):
+        if play_if_successful:
+            settings['play_all_mode'] = True
+            unwrap_and(play)
+            return
+    if not settings['search_terms']:
+        search_terms = settings['filtered_list'][settings['left'].selected][0]
+        if search_terms.endswith('/'):
+            settings['selected_pane'] = 0
+            update_filter(search_terms.lstrip('-').strip('/'))
+            settings['pane0_cursor'] = len(settings['search_terms'])
+            return
+    buffer_list = append_intent_source()
+    if buffer_list:
+        settings['undo_playList'] = list(settings['playlist'])
+
+        # Scroll to pane2 footer. Function check_pane2_selected_item() might go back up.
+        settings['right'].top_item = max(
+            settings['right'].top_item,
+            settings['right'].items_len - settings['termH'] + 1,
+        )  # todo tricky : calling update_items_len() bellow...?
+
+        settings['playlist'].extend(buffer_list)
+
+        current_playlist_len = settings['right'].items_len
+
+        settings['right'].update_items_len(len(settings['playlist']))
+
+        if play_if_successful:
+            settings['right'].move_selection(current_playlist_len)  # That is n+1
+            settings['selected_pane'] = 2
+            unwrap_and(play)
+
+
+def is_url(string):
+    """return true for local or distant URLs, any protocol.
+    return false for relative paths, or plain strings."""
+    return string[:1] == '/' or '://' in string[:10]
+    # load_playlist() reasonably loops around is_url(), don't optimize yet.
+
+
+def expand_m3u():
+    try:
+        with open(settings['playlist'][settings['right'].selected]) as file:
+            stripped = (item.strip() for item in file.read().splitlines())
+    except (OSError, UnicodeDecodeError, IndexError):
+        settings['msg_and_action'] = ('That is no playlist we can expand.', None)
+        return
+    settings['undo_playList'] = settings['playlist']
+    settings['playlist'] = list(
+        settings['undo_playList'][: settings['right'].selected]
+        + [item for item in stripped if item and not item.startswith('#')]
+        + settings['undo_playList'][settings['right'].selected + 1 :]
+    )
+    settings['right'].update_items_len(len(settings['playlist']))
+
+
+# have multiple notification lines, with first in green?
+def notification_action():
+    try:
+        action = settings['msg_and_action'][1]  # nested notification in expand_m3u()
+        settings['msg_and_action'] = ()  # so we clear before we call
+        action()  # here do we raise TypeError on None.
+        return True
+    except (IndexError, TypeError):
+        return False
+
+
+def before_cursor():
+    return settings['search_terms'][: settings['pane0_cursor']]
+
+
+def after_cursor():
+    return settings['search_terms'][settings['pane0_cursor'] :]
+
+
+# Context independent keys
+def panes_tab():
+    settings['selected_pane'] = (settings['selected_pane'] + 1) % 3
+
+
+def panes_btab():
+    settings['selected_pane'] = (settings['selected_pane'] - 1) % 3
+
+
+def panes_ctrl_f():
+    settings['selected_pane'] = 0
+
+
+def panes_bspace():
+    settings['selected_pane'] = 0
+    update_filter(before_cursor()[:-1] + after_cursor())
+    settings['pane0_cursor'] -= 1
+
+
+def panes_ctrl_r():
+    settings['shuffle_mode'] = not settings['shuffle_mode']
+
+
+def panes_ctrl_s():
+    file = os.path.join(settings['temp_dir'], f'{Config.profile}-export.m3u')
+    settings['msg_and_action'] = (save_playlist_file(file), None)
+
+
+def panes_ctrl_u():
+    unwrap_and(update_music_db_file)
+
+
+def panes_ctrl_z():
+    buffer = list(settings['playlist'])
+    settings['playlist'] = list(settings['undo_playList'])
+    settings['undo_playList'] = buffer
+    settings['right'].update_items_len(len(settings['playlist']))
+
+
+def panes_ctrl_q():
+    unwrap_and(save_and_quit)
+
+
+def panes_escape():
+    if settings['search_terms']:
+        update_filter('')
+        settings['selected_pane'] = 0
+    else:
+        settings['msg_and_action'] = (
+            'Press [Enter] to quit.',
+            lambda: unwrap_and(save_and_quit),
+        )
+
+
+def panes_move():
+    pane = settings[('left', 'left', 'right')[settings['selected_pane']]]
+    move = {
+        'KEY_UP': (pane.move_selection_relative, -1),
+        'KEY_DOWN': (pane.move_selection_relative, 1),
+        'KEY_MOUSE_UP': (pane.move_selection_relative, -3),
+        'KEY_MOUSE_DOWN': (pane.move_selection_relative, 3),
+        'KEY_PPAGE': (pane.move_selection_relative, -settings['termH']),
+        'KEY_NPAGE': (pane.move_selection_relative, settings['termH']),
+        'KEY_HOME': (pane.move_selection, 0),
+        'KEY_END': (pane.move_selection, pane.items_len),
+    }[settings['key']]
+
+    if settings['selected_pane'] == 0:
+        if settings['key'] not in ('KEY_DOWN', 'KEY_NPAGE', 'KEY_MOUSE_DOWN'):
+            return
+        move = (move[0], move[1] - 1)
+        settings['selected_pane'] = 1
+    elif (
+        settings['selected_pane'] == 1
+        and settings['key'] in ('KEY_UP', 'KEY_PPAGE', 'KEY_MOUSE_UP')
+        and settings['left'].selected == 0
+    ):
+        settings['selected_pane'] = 0
+        return
+    move[0](move[1])
+
+
+# pane 0 keys
+def pane0_space():
+    ins_str_at_cur(' ')
+
+
+def pane0_right():
+    settings['pane0_cursor'] += 1
+
+
+def pane0_left():
+    settings['pane0_cursor'] -= 1
+
+
+def right_cut():
+    # Thanks Padraic Cunningham on https://stackoverflow.com/a/30020209
+    return next((i for i, ch in enumerate(after_cursor()[1:]) if ch in SEPS), 9999) + 1
+
+
+def left_cut():
+    # Combine it with PEP 448 (https://stackoverflow.com/a/48232574)
+    try:
+        *_, last = (i for i, ch in enumerate(before_cursor()[1:-1]) if ch in SEPS)
+    except ValueError:
+        return 0
+    return last + 2
+
+
+def pane0_ctrl_left():
+    settings['pane0_cursor'] = left_cut()
+
+
+def pane0_ctrl_right():
+    settings['pane0_cursor'] += right_cut()
+
+
+def pane0_ctrl_bspace():
+    position = left_cut()
+    update_filter(before_cursor()[:position] + after_cursor())
+    settings['pane0_cursor'] = position
+
+
+def pane0_ctrl_delete():
+    update_filter(before_cursor() + after_cursor()[right_cut() :])
+
+
+def pane0_begin():
+    settings['pane0_cursor'] = 0
+
+
+def pane0_end():
+    settings['pane0_cursor'] = len(settings['search_terms'])
+
+
+# Pane 1 keys
+def pane1_space():
+    append_to_playlist()
+
+
+def pane1_enter():
+    append_to_playlist(play_if_successful=True)
+
+
+# Pane 2 keys
+def pane2_space():  # Copy track at playlist's end
+    if settings['right'].items_len:
+        settings['undo_playList'] = list(settings['playlist'])
+        settings['playlist'].append(settings['playlist'][settings['right'].selected])
+        settings['right'].update_items_len(len(settings['playlist']))
+
+
+def pane2_ctrl_a():
+    settings['undo_playList'] = list(settings['playlist'])
+    settings['playlist'] = []
+    settings['right'].update_items_len(0)
+
+
+def pane2_delete():
+    settings['undo_playList'] = list(settings['playlist'])
+    try:
+        del settings['playlist'][settings['right'].selected]
+        # del works in place and is better than making a list slice.
+    except IndexError:
+        pass
+    else:
+        settings['right'].update_items_len(len(settings['playlist']))
+
+
+def pane2_enter():
+    if settings['playlist']:
+        unwrap_and(play)
+
+
+# Pane 0 or 1 keys
+def pane01_ctrl_a():
+    if not settings['search_terms']:
+        settings['msg_and_action'] = ('Use slash to play entire library', None)
+    elif settings['filtered_list'] in ([('/', '/')], [SEARCH_YT]):
+        settings['msg_and_action'] = ('Nothing to add', None)
+    else:
+        append_to_playlist(get_all)
+
+
+def pane01_delete():
+    update_filter(before_cursor() + after_cursor()[1:])
+
+
+# util functions
+def ensure_cursor_in_scope():
+    if settings['pane0_cursor'] < 0:
+        settings['pane0_cursor'] = 0
+    if settings['pane0_cursor'] > len(settings['search_terms']):
+        settings['pane0_cursor'] = len(settings['search_terms'])
+
+
+def draw_footer():
+    try:
+        if settings['selected_pane'] == 0:
+            txt = f'musics path: {Config.user_musics_path}'
+        elif settings['selected_pane'] == 1:
+            txt = settings['filtered_list'][settings['left'].selected][0]
+        else:
+            txt = settings['playlist'][settings['right'].selected]
+            if txt.endswith(('.m3u', '.m3u8')) and not settings['msg_and_action']:
+                settings['msg_and_action'] = (
+                    '^E to expand playlist file',
+                    lambda: unwrap_and(play),
+                )
+    except IndexError:
+        txt = '[Playlist is empty]'
+        settings['stdscr'].addstr(2, settings['panes_sep'], txt)
+    settings['stdscr'].addnstr(settings['termH'] + 3, 0, txt, settings['termW'] - 1)
+    if settings['shuffle_mode']:
+        settings['stdscr'].addch(settings['termH'] + 3, settings['termW'] - 11, ' ')
+        settings['stdscr'].addstr(' Shuffle ', curses.A_REVERSE)
+
+
+def draw_cursors():
+    """Drawing (inverting) "cursor" and selections"""
+    # https://misc.flogisoft.com/bash/tip_colors_and_formatting#terminals_compatibility
+    # curses.A_UNDERLINE has no effect on linux TTY, but it is not essential.
+
+    settings['stdscr'].chgat(
+        settings['left'].selected - settings['left'].top_item + 2,
+        0,
+        settings['panes_sep'] - 1,
+        (
+            curses.color_pair(1) + curses.A_BOLD,
+            curses.A_REVERSE,
+            curses.color_pair(1) + curses.A_BOLD,
+        )[settings['selected_pane']],
+    )
+    settings['stdscr'].chgat(
+        settings['right'].selected - settings['right'].top_item + 2,
+        settings['panes_sep'],
+        settings['termW'] - settings['panes_sep'] - 1,
+        (
+            curses.color_pair(1) + curses.A_BOLD,
+            curses.color_pair(1) + curses.A_BOLD,
+            curses.A_REVERSE,
+        )[settings['selected_pane']],
+    )
+    settings['stdscr'].chgat(
+        1,
+        settings['pane0_cursor'] + 20,
+        1,
+        (
+            curses.A_REVERSE,
+            curses.A_UNDERLINE + curses.color_pair(1) + curses.A_BOLD,
+            curses.A_UNDERLINE + curses.color_pair(1) + curses.A_BOLD,
+        )[settings['selected_pane']],
+    )
+
+
+def draw_main_window():
+    """Redraw the complete screen. Only bottom border and help could be spared,
+    but most key presses alters search_terms, that are highlighted everywhere...
+    Not using curse panels, that are not portable to netBSD:
+    https://invisible-island.net/ncurses/man/panel.3x.html#h2-COMPATIBILITY
+    https://invisible-island.net/ncurses/ncurses.faq.html#uses_of_library
+    """
+
+    ensure_cursor_in_scope()
+
+    stdscr = settings['stdscr']  # Make it local, for speed?
+    # Not measured, but: https://stackoverflow.com/questions/12590058
+    stdscr.erase()  # Better on flickering here than stdscr.clear().
+
+    stdscr.move(0, 0)  # Print bindings on first line.
+    # https://stackoverflow.com/questions/14571860/
+    # https://docs.python.org/3.7/library/curses.panel.html
+    for binding, action in itertools.islice(BINDINGS, 0, settings['termW'] // 15):
+        # 15: i.e. bellow the avergage binding that prints on 16 chars.
+        stdscr.addstr(binding, curses.A_REVERSE)
+        stdscr.addstr(action)
+    try:
+        msg = settings['msg_and_action'][0]
+        stdscr.move(
+            0, settings['termW'] - len(msg) - 1
+        )  # Print bindings on first line.
+        # https://stackoverflow.com/questions/14571860/
+        # https://docs.python.org/3.7/library/curses.panel.html
+        stdscr.addstr(msg, curses.A_REVERSE)
+    except IndexError:
+        pass
+
+    Pane.words = [
+        (word, len(word))
+        for word in convert_to_ascii_lower(settings['search_terms']).split()
+    ]
+    settings['left'].draw()
+    settings['right'].draw()
+
+    # Draw borders and titles
+    stdscr.hline(1, 0, curses.ACS_HLINE, settings['termW'])
+    stdscr.hline(settings['termH'] + 2, 0, curses.ACS_HLINE, settings['termW'])
+    stdscr.addch(1, settings['panes_sep'] - 1, curses.ACS_TTEE)
+    stdscr.addch(settings['termH'] + 2, settings['panes_sep'] - 1, curses.ACS_BTEE)
+    stdscr.addstr(1, 3, ' Search results: ')
+    stdscr.addstr(1, settings['panes_sep'] + 3, ' Playlist ')
+
+    stdscr.addstr(
+        1, 20, f"{settings['search_terms']} ", curses.color_pair(1) + curses.A_BOLD
+    )  # After "Playlist" so it gets not overwritten.
+    draw_footer()
+    # settings['stdscr'].addstr(
+    #     settings['termH'] + 3,
+    #     settings['termW'] - 15,
+    #     settings['key'] if 'key' in settings.keys() else "press a key",
+    #     curses.A_REVERSE
+    # )
+    draw_cursors()
+    stdscr.refresh()
+
+
+def main_window_actions():
+    # can move in notification, now key is a global
+    if settings['key'] == 'KEY_ENTER' and notification_action():
+        return
+
+    if settings['key'] == 'KEY_RESIZE':
+        unwrap_and(adapt_to_terminal_size)
+    else:
+        settings['msg_and_action'] = ()
+
+    if not settings['key'].startswith(('^', 'KEY_')) and settings['key'] != ' ':
+        settings['selected_pane'] = 0
+        if len(settings['key']) > 1 and is_url(settings['key']):
+            update_filter('')
+            for dnd in settings['key'].split('^M'):
+                # Support for dropping multiple files
+                # To expand folders, we'd have to distinguish distant URLs from folders.
+                update_filter(dnd)
+                append_to_playlist()  # depends on previous update_filter()
+            settings['selected_pane'] = 2
+            settings['pane0_cursor'] = len(settings['key'])
+        else:
+            ins_str_at_cur(settings['key'])
+    else:
+        try:
+            PANES_KEYS[settings['key']]()  # Global bindings
+        except KeyError:
+            try:
+                PANE_SPECIFIC_KEYS[settings['selected_pane']][settings['key']]()
+            except KeyError:
+                pass  # Unbound key
+
+
+def read_keyboard():
+    """read from stdin and return text or key names."""
+    # Curses doc mentions getch but not get_wch for stdscr.nodelay(False)
+    settings['stdscr'].timeout(-1)  # Negative: blocking read.
+    key = ''
+    while True:
+        try:
+            char = settings['stdscr'].get_wch()
+        except (ValueError, curses.error):  # Respectively: invalid input, read timeout.
+            break
+        settings['stdscr'].timeout(0)  # subsequent reads will be non-blocking
+        try:  # If char was an int
+            key += curses.keyname(char).decode()
+            break  # So mouse wheel (often sending KEY_DOWN thrice) works, for instance
+        except TypeError:  # Expected string, got int
+            try:
+                char = curses.unctrl(char).decode()
+            except OverflowError:
+                pass  # Not a ctrl key
+            else:
+                if char == '^C':
+                    raise KeyboardInterrupt from TypeError
+            key += char
+    if len(key) in (3, 4, 5) and key.startswith('k'):
+        try:
+            key = {
+                'kLFT5': '^[[1;5D',
+                'kRIT5': '^[[1;5C',
+                'kDC5': '^[[3;5~',
+            }[key]
+        except KeyError:
+            return ''
+    elif key == '^M':
+        # qterminal issues KEY_ENTER on shift+enter, ^M on enter.
+        return 'KEY_ENTER'
+    if key == 'KEY_MOUSE':
+        # curses.mouseinterval(0)
+        bstate = curses.getmouse()[4]
+        if bstate & curses.BUTTON4_PRESSED:
+            return 'KEY_MOUSE_UP'
+        elif bstate & curses.BUTTON2_PRESSED or (
+            # todo: test on mint una (python 3.8): If button2 does not work, just remove it
+            # and leave the test before button5, to prevent the crash. linux ncurse is a mess.
+            # https://comp.lang.python.narkive.com/eci7hz9r/python-curses-constant-names-for-mouse-wheel-movements
+            sys.version_info > (3, 10) and bstate & curses.BUTTON5_PRESSED
+            # BUTTON5_* and the like are python 3.10+, some terminals use BUTTON2_PRESSED
+        ):
+            return 'KEY_MOUSE_DOWN'
+    return key
+
+
+def get_enter_key():
+    def read_stdin(stdin_file):
+        tty.setraw(stdin_file)
+        mode = termios.tcgetattr(stdin_file)
+        mode[6][termios.VMIN] = 0  # 6: CC, see tty module source code
+        mode[6][termios.VTIME] = 1
+        termios.tcsetattr(stdin_file, termios.TCSAFLUSH, mode)
+        for i in range(Config.print_delay, 0, -1):
+            print(f'Timeout in {i}s, press any key to skip.', end='\r')
+            keypress, _, _ = select([stdin_file], [], [], 1)
+            if keypress:
+                break
+        return sys.stdin.read() == '\r'
+
+    stdin_fd = sys.stdin.fileno()
+    try:
+        orig_fl = termios.tcgetattr(stdin_fd)
+    except termios.error:
+        return False  # tests piped data: not stdin-like file for termios
+    else:
+        return_flag = read_stdin(stdin_fd)
+        termios.tcsetattr(stdin_fd, termios.TCSANOW, orig_fl)
+        return return_flag
+
+
+def play():
+    """Play. Don't scrap disk needlessly: don't check files with
+    os.path.isfile(). Don't hand mpv a folder but individual files.
+    (even to play the complete library)"""
+
+    def tmp_file_name():
+        # quick and dirty replacement for tempfile, as random alone is
+        # responsible for 60% of 'import tempfile' runtime
+        # https://github.com/python/cpython/blob/3.9/Lib/tempfile.py
+        for number in itertools.count():
+            name = f'{Config.profile}_playing_list_{number:02d}.m3u'
+            path = os.path.join(settings['temp_dir'], name)
+            if os.path.exists(path):
+                continue
+            return path
+
+    os.makedirs(os.path.dirname(settings['temp_dir']), exist_ok=True)
+    filename = tmp_file_name()  # almost unic per session, init and touch at launch?
+
+    if settings['play_all_mode']:
+        settings['play_all_mode'] = False
+        dump_all_to_playlist(filename)
+    else:
+        save_playlist_file(filename)
+
+    def insert_arguments(command):
+        if settings['shuffle_mode']:
+            command.insert(1, '--shuffle')
+        else:
+            command.insert(1, f'--playlist-start={settings["right"].selected}')
+        return command
+
+    # That's a proper way (https://mpv.io/manual/master/#options-load-unsafe-playlists)
+    # Using subprocess.run(input=) to pipe playlist to mpv deactivate console key input.
+    cmd = insert_arguments(Config.mpv_command + [filename])
+    print(f'\n> {" ".join(cmd)}')
+
+    try:
+        subprocess.run(cmd, check=False)
+    except FileNotFoundError:
+        save_and_quit('install mpv or set backEndCommand in config and restart lizzy.')
+    # If lizzy gets SIGKILL, mpv continues on its own. Nothing we can do.
+    # Don't catch KeyboardInterrupt: die on ^C in mpv or SIGINT to either lizzy or mpv.
+
+    try:
+        os.remove(filename)
+    except FileNotFoundError:
+        pass
+
+
+def save_playlist_file(filepath):
+    """save or export session playlist to a m3u file."""
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, mode='w', encoding='utf-8') as playlist_file:
+        for music in settings['playlist']:
+            playlist_file.write(f'{music}\n')
+    return f'Saved in {filepath}.'
+
+
+def dump_all_to_playlist(filepath):
+    """assumes that os.makedirs() was allready called."""
+    prefixed_indexed_files = (
+        reconstruct_path(item)
+        for item, _ in settings['music_db_list']
+        if not item.endswith('/')
+    )
+
+    with open(filepath, mode='w', encoding='utf-8') as playlist_file:
+        for music in prefixed_indexed_files:
+            playlist_file.write(f'{music}\n')
+    return f'Saved in {filepath}.'
+
+
+# without contextlib contextmanager
+class CurseWrap:
+    """curses module's wrapper() function calls cbreak(),
+    which is unpredictable when mixed with raw():
+    see 'Notes' section here: https://linux.die.net/man/3/raw
+    and https://invisible-island.net/ncurses/ncurses-intro.html#caution
+
+    Also initscr() must not be called twice for portability:
+    https://stackoverflow.com/a/31441709
+
+    In raw mode, we can interpret ^C, and still have python
+    handle signals, such as SIGTERM..."""
+
+    def __init__(self):
+        try:
+            settings['stdscr'] = curses.initscr()
+            curses.mousemask(-1)
+        except curses.error:  # initscr() calls setupterm(): read TERM in env
+            print("curse init failure.")
+            sys.exit("Maybe ssh env?: try 'export TERM=screen ssh host'.")
+        try:
+            curses.start_color()
+        except curses.error:
+            pass  # Harmless one
+        # Number 0 color-pair is imposed: white on black
+        curses.use_default_colors()  # COLORS are not the same as COLOR_PAIRS
+        curses.init_pair(1, 2, -1)  # Green
+        settings['sub_window'] = settings['stdscr'].subwin(1, 1, 0, 0)
+        adapt_to_terminal_size()
+
+    def __enter__(self):
+        settings['stdscr'].refresh()
+        settings['stdscr'].leaveok(True)  # Save time on usual cursor-motions
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass  # Harmless one
+        curses.noecho()  # Turn off echoing of keys
+        curses.raw()  # No line buffering, no SIGNAL handling (for ^S)
+        settings['stdscr'].keypad(1)  # Convert escaped seqs: 'curses.KEY_LEFT'
+        curses.nonl()  # Speed up + KEY_ENTER recognition
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        # curses.nl()
+        settings['stdscr'].keypad(0)
+        curses.flushinp()  # Dump any unfetched characters
+        curses.echo()
+        curses.noraw()  # invisible-island.net/ncurses/ncurses-intro.html#caution
+        curses.endwin()  # != delscreen(), windows can be refreshed.
+
+
+def adapt_to_terminal_size():
+    settings['termH'], settings['termW'] = settings['stdscr'].getmaxyx()
+    settings['termH'] -= 4
+    settings['panes_sep'] = int(settings['termW'] // 1.5)
+
+    settings['left'].right_limit = settings['panes_sep'] - 2
+
+    settings['right'].left_limit = settings['panes_sep']
+    settings['right'].right_limit = settings['termW'] - settings['panes_sep'] - 2
+
+    Pane.green = curses.color_pair(1) + curses.A_BOLD
+
+
+def unwrap_and(action):
+    settings['unwrapped_action'] = action
+
+
+def check_updates():
+    """Comparing last tag name with SCRIPT_REVISION
+    Can't retreive _just_ last version directly from gitlab API
+    project 7281274 (https://gitlab.com/api/v4/users/arnaudv6/projects)"""
+
+    # pylint: disable=import-outside-toplevel
+    # those imports where responsible for half the load-time on pi-zero
+    import json
+    from urllib.request import urlopen
+    from urllib.error import URLError
+    from socket import timeout
+
+    gitlab_api_url = 'https://gitlab.com/api/v4/projects/7281274/releases'
+    try:
+        with urlopen(gitlab_api_url, timeout=5) as raw_json:
+            data = json.load(raw_json)
+    except (URLError, timeout, json.JSONDecodeError):
+        return 'Could not retreive upstream version number.'
+    else:
+        # Odd, but works even when comparing releases strings of different lenghts
+        if data[0]['name'].encode('ascii') <= SCRIPT_REVISION.encode('ascii'):
+            return 'lizzy is up-to-date'
+        return """\nA new version of lizzy is available upstream grab it here:
+        https://gitlab.com/Arnaudv6/lizzy#instructions"""
+
+
+def parse_cl_args():
+    parser = argparse.ArgumentParser(
+        add_help=False,  # Cleaner than parser._action_groups.pop()
+        description='''Search your music (videos...) by directories and files names.
+        Your playlist gets fed to mpv.
+        On first run, you might want to create the index: press ^U.''',
+        epilog='''Resident files are stored in XDG_CONFIG_HOME dir (i.e.
+        '~/.config/lizzy/'). The rest is all in tmpfs (i.e. '/tmp/lizzy_player').''',
+        prog='lizzy',  # Be consistent with the name printed along with version.
+    )
+    single_group = parser.add_argument_group('arguments')
+    single_group.add_argument(
+        '-h', '--help', action='store_true', help='show this help message and exit.'
+    )
+    single_group.add_argument(
+        '-u',
+        '--update',
+        action='store_true',
+        help='check upstream for updates, print and exit.',
+    )
+    single_group.add_argument(
+        '--profile',
+        default='DEFAULT',
+        help='''Use profile NAME for this session.
+        For 'why?' and 'how?', see: https://gitlab.com/Arnaudv6/lizzy#usage''',
+    )
+    single_group.add_argument(
+        'playlist',
+        type=argparse.FileType('r'),
+        metavar='PLAYLIST',
+        nargs='?',
+        help='''
+    load PLAYLIST. (discard this profile's last session). PLAYLIST is a UTF8 plain
+    text file with 1 entry per line. Entries can be URLs and paths (as in a M3U8 file),
+    or even raw names. Relative paths are relative to musics library dir (define a
+    profile if you need paths relative to elsewhere).''',
+    )  # default='default playlist', limitting to one playlist yet
+    arguments = parser.parse_intermixed_args()  # More flexible than parse_args()
+    Config.profile = arguments.profile
+
+    if arguments.help:
+        parser.print_help()
+        sys.exit()
+    if arguments.update:
+        sys.exit(check_updates())
+    try:  # no need to expanduser after argparse.FileType()
+        settings['user_specified_playlist'] = os.path.normpath(arguments.playlist.name)
+    except (TypeError, AttributeError):
+        pass
+
+
+def main():
+    define_signals_actions()
+    print(f'lizzy, version: {SCRIPT_REVISION}')
+    if sys.version_info < (3, 6):
+        sys.exit('Python 3.6 or later is required.')
+
+    if not sys.stdin.isatty():  # This works properly through ssh.
+        if input('Warning: pipe to lizzy only for debugging\n').lower() != 'debug':
+            sys.exit('Quitting')
+    if not sys.stdout.isatty():
+        # Pipes are FIFO, sys.stdout.flush() wouldn't avail. Output order is a mess.
+        sys.exit('lizzy uses curses. You do not want to pipe its output')
+
+    try:
+        locale.setlocale(locale.LC_ALL, '')  # First thing to do with curses
+    except locale.Error:
+        print('locale is unsupported or not set correctly.')
+        print('This is sometimes due to SSH environment.')
+        print('Press any key to exit, ENTER to proceed anyway.')
+        if not get_enter_key():
+            sys.exit('\nQuitting')
+        else:
+            print()
+    os.environ.setdefault('ESCDELAY', '25')  # Nuke [Esc.] key's default delay in curses
+    os.environ.setdefault('NCURSES_NO_PADDING', 'True')  # Unneeded timings
+
+    parse_cl_args()
+
+    # Set terminal title. I could not manage with curses.putp()
+    print(f'\33]0;lizzy - {Config.profile}\a', end='', flush=True)
+
+    Config()
+    read_music_db_file()
+    curse_wrap = CurseWrap()  # set settings['termH'] before make_filtered_list()
+    make_filtered_list()
+    read_startup_playlist()
+
+    while True:
+        # no "as stdscr". (global stdscr and curse_wrap for adapt_to_terminal_size())
+        with curse_wrap:
+            while not callable(settings['unwrapped_action']):
+                draw_main_window()
+                settings['key'] = read_keyboard()
+                main_window_actions()
+        settings['unwrapped_action']()  # pylint: disable=not-callable
+        settings['unwrapped_action'] = None
+
+
+def define_signals_actions():
+    """Signals handling in lizzy:
+    https://manpages.debian.org/buster/manpages/signal.7.en.html
+    (9) SIGKILL: cannot be caught, blocked, or ignored.
+        https://docs.python.org/3/library/signal.html#signal.SIGKILL
+    (2) SIGINT: Interrupt from keyboard (CTRL + C). Raises KeyboardInterrupt: Good.
+        in curses, read_keyboard() raises KeyboardInterrupt on ^C for consistency.
+        (we use raw() mode so we can catch ^S)
+        No need for async window drawing: _tiny_ delay to raise KeyboardInterrupt.
+        Don't save playlist on KeyboardInterrupt but restore terminal (see near EOF)
+    sys.exit() does raise SystemExit exception we don't save playlist for either.
+    """
+
+    # Die with those 4 signals, kill mpv also and attempt to save playlist last state.
+
+    # (1) controlling terminal hangup or controlling process died. Ignored by default.
+    signal.signal(signal.SIGHUP, signal_term)
+    # (3) SIGQUIT = SIGTERM + dump core. Ignored by default.
+    signal.signal(signal.SIGQUIT, signal_term)
+    # (13) Broken pipe: write to pipe with no readers. Ignored by default.
+    signal.signal(signal.SIGPIPE, signal_term)
+    # (15) Termination signal.
+    signal.signal(signal.SIGTERM, signal_term)
+
+
+def signal_term(signal_num, frame):
+    del frame
+    # No function to get signal names: using a dict for the ones we catch.
+    sig_names = {1: 'SIGHUP', 3: 'SIGQUIT', 13: 'SIGPIPE', 15: 'SIGTERM'}
+    raise ReiceivedSignal(f'Received signal {sig_names[signal_num]}')
+
+
+def save_and_quit(*strings):
+    """should be used instead of sys.exit() where we want and can save."""
+    for string in strings:
+        print_error(string)
+    sys.exit(save_playlist_file(Config.session_file))
+
+
+def print_error(print_text):
+    print(f'\033[91m{print_text}\033[0m')
+
+
+def print_wait(print_text):
+    print(print_text)
+    print("Press any key")
+    get_enter_key()
+
+
+SEARCH_YT = ('Search youtube', '')  # Empty lowercase string => no coloring
+
+# Qterminal produces backspace for ctrl+backspace and vice-versa
+
+# could be checked after panes specific keys, so we remove a
+# bunch of 'if' from functions like panes_move()
+
+# when python10 is everywhere, remove all that crap and use pattern matching
+PANES_KEYS = {
+    '^I': panes_tab,
+    'KEY_BTAB': panes_btab,
+    '^[^I': panes_btab,
+    'KEY_DOWN': panes_move,
+    'KEY_UP': panes_move,
+    'KEY_MOUSE_UP': panes_move,
+    'KEY_MOUSE_DOWN': panes_move,
+    'KEY_PPAGE': panes_move,
+    'KEY_NPAGE': panes_move,
+    'KEY_BACKSPACE': panes_bspace,
+    '^?': panes_bspace,
+    # ^H dans qterminal : curses.erasechar()
+    '^H': pane0_ctrl_bspace,
+    '^F': panes_ctrl_f,
+    '^R': panes_ctrl_r,
+    '^S': panes_ctrl_s,
+    '^U': panes_ctrl_u,
+    '^Z': panes_ctrl_z,
+    'KEY_SUSPEND': panes_ctrl_z,
+    '^Q': panes_ctrl_q,
+    '^W': panes_ctrl_q,
+    '^[': panes_escape,
+}  # Terminal convention differs on several keys: BS is either '^H' or '^?'...
+
+
+PANE0_KEYS = {
+    ' ': pane0_space,
+    'KEY_RIGHT': pane0_right,
+    'KEY_LEFT': pane0_left,
+    '^[[1;5D': pane0_ctrl_left,
+    '^[[1;5C': pane0_ctrl_right,
+    '^[[3;5~': pane0_ctrl_delete,
+    '^\\': pane0_ctrl_delete,
+    '^A': pane01_ctrl_a,
+    'KEY_DC': pane01_delete,
+    'KEY_HOME': pane0_begin,
+    'KEY_END': pane0_end,
+    'KEY_ENTER': panes_tab,
+}
+
+PANE1_KEYS = {
+    ' ': pane1_space,
+    'KEY_RIGHT': panes_tab,
+    '^A': pane01_ctrl_a,
+    'KEY_DC': pane01_delete,
+    'KEY_HOME': panes_move,
+    'KEY_END': panes_move,
+    'KEY_ENTER': pane1_enter,
+}
+
+PANE2_KEYS = {
+    ' ': pane2_space,
+    'KEY_LEFT': panes_btab,
+    '^A': pane2_ctrl_a,
+    '^E': expand_m3u,
+    'KEY_DC': pane2_delete,
+    'KEY_HOME': panes_move,
+    'KEY_END': panes_move,
+    'KEY_ENTER': pane2_enter,
+}
+
+PANE_SPECIFIC_KEYS = (PANE0_KEYS, PANE1_KEYS, PANE2_KEYS)
+
+# BINDINGS is used only once in draw_main_window(), but I like it here out of the loop.
+# only '^Q' matters: rest is short version of homepage-doc to spare everyone's memory.
+BINDINGS = (
+    ('^A', ':add/del. all    '),
+    ('^U', ':update DB    '),
+    ('^Q', ':quit    '),
+    ('^R', ':shuffle    '),
+    ('^S', ':save m3u    '),
+    ('^Z', ':undo/redo (playlist)'),
+)
+
+SEPS = {' ', '-', '_', '/', '.', '&'}
+
+if __name__ == '__main__':
+    try:
+        main()
+    except curses.error:
+        save_and_quit('It seems terminal size is too small to draw something')
+    except ReiceivedSignal as exc:
+        if Config.session_file:
+            save_and_quit(exc)
+        else:
+            print_error(exc)
+    except KeyboardInterrupt:
+        # can never be raised from wrap
+        print_error('Keyboard interruption')
+    except SystemExit:
+        # sys.exit() is never called (or SystemExit raised) from wrap
+        raise  # catching here to avoid catchall bellow
+    except (BaseException, Exception, ArithmeticError, BufferError, LookupError):
+        # At this point, any uncaught exception is a bug
+        print_error(
+            """
+lizzy just crashed. You can help improve it by copying below error to a bug here:
+https://gitlab.com/Arnaudv6/lizzy/issues\n----------------------------------
+"""
+        )
+        # breakpoint()
+        raise

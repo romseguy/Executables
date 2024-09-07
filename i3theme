@@ -1,0 +1,3 @@
+#!/bin/bash
+sed -i '/Net\/ThemeName/cNet\/ThemeName '$1'' ~/.xsettingsd
+killall -HUP xsettingsd

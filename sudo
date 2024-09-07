@@ -1,0 +1,9 @@
+#!/bin/bash
+
+# Check Root permission
+if [[ $EUID -ne 0 ]]; then
+	sudo $0 $@
+	exit $?
+fi
+
+synaptic
